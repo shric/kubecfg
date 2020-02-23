@@ -52,7 +52,7 @@ var diffCmd = &cobra.Command{
 			return err
 		}
 
-		c.Client, c.Mapper, _, err = getDynamicClients(cmd)
+		c.Client, c.Mapper, c.Discovery, err = getDynamicClients(cmd)
 		if err != nil {
 			return err
 		}

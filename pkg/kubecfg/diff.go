@@ -20,6 +20,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/kubernetes/pkg/kubectl/cmd/util/openapi"
 	"os"
 	"regexp"
 	"sort"
@@ -31,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/client-go/discovery"
 	"k8s.io/client-go/dynamic"
 
 	"github.com/bitnami/kubecfg/utils"
@@ -47,6 +50,7 @@ var DiffKeyValue = regexp.MustCompile(`"([-._a-zA-Z0-9]+)":\s"([[:alnum:]=+]+)",
 type DiffCmd struct {
 	Client           dynamic.Interface
 	Mapper           meta.RESTMapper
+	Discovery        discovery.DiscoveryInterface
 	DefaultNamespace string
 	OmitSecrets      bool
 
@@ -58,6 +62,14 @@ func (c DiffCmd) Run(apiObjects []*unstructured.Unstructured, out io.Writer) err
 
 	dmp := diffmatchpatch.New()
 	diffFound := false
+	schemaDoc, err := c.Discovery.OpenAPISchema()
+	if err != nil {
+		return err
+	}
+	schemaResources, err := openapi.NewOpenAPIData(schemaDoc)
+	if err != nil {
+		return err
+	}
 	for _, obj := range apiObjects {
 		desc := fmt.Sprintf("%s %s", utils.ResourceNameFor(c.Mapper, obj), utils.FqName(obj))
 		log.Debug("Fetching ", desc)
@@ -85,6 +97,49 @@ func (c DiffCmd) Run(apiObjects []*unstructured.Unstructured, out io.Writer) err
 			fmt.Fprintf(out, "%s doesn't exist on server\n", desc)
 			diffFound = true
 			continue
+		}
+
+		if c.DiffStrategy == "update" {
+			schema := schemaResources.LookupResource(obj.GroupVersionKind())
+			if !isValidKindSchema(schema) {
+				// Invalid schema (eg: custom resource without
+				// schema returns trivial type:object with k8s >=1.15)
+				log.Debugf("Ignoring invalid schema for %s", obj.GroupVersionKind())
+				schema = nil
+			}
+			mergedObj, err := patch(liveObj, obj, schema)
+			if err != nil {
+				return err
+			}
+			if ts := mergedObj.GetCreationTimestamp(); ts.IsZero() {
+				liveObj.SetCreationTimestamp(metav1.Time{})
+			}
+			if apiequality.Semantic.DeepEqual(liveObj, mergedObj) {
+				log.Debugf("Not updating %s - unchanged", desc)
+				return nil
+			}
+			liveObjObject := liveObj.Object
+			utils.DeleteMetaDataAnnotation(liveObj, AnnotationOrigObject)
+			utils.DeleteMetaDataAnnotation(mergedObj, AnnotationOrigObject)
+			liveObjText, _ := json.MarshalIndent(liveObjObject, "", "  ")
+			mergedObjText, _ := json.MarshalIndent(mergedObj.Object, "", "  ")
+
+			liveObjTextLines, mergedObjTextLines, lines := dmp.DiffLinesToChars(string(liveObjText), string(mergedObjText))
+
+			diff := dmp.DiffMain(
+				string(liveObjTextLines),
+				string(mergedObjTextLines),
+				false)
+
+			diff = dmp.DiffCharsToLines(diff, lines)
+			if (len(diff) == 1) && (diff[0].Type == diffmatchpatch.DiffEqual) {
+				fmt.Fprintf(out, "%s unchanged\n", desc)
+			} else {
+				diffFound = true
+				text := c.formatDiff(diff, isatty.IsTerminal(os.Stdout.Fd()), c.OmitSecrets && obj.GetKind() == "Secret")
+				fmt.Fprintf(out, "%s\n", text)
+			}
+			return nil
 		}
 
 		liveObjObject := liveObj.Object
